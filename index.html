@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bike Route Planner</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root { --bg:#f6f6f4; --panel:#fff; --text:#1d1d1b; --muted:#6b6b66; --accent:#1a73e8; --danger:#c62828; --border:#ddd; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161616; --panel:#222; --text:#eee; --muted:#9a9a95; --accent:#8ab4f8; --danger:#ef6b6b; --border:#3a3a3a; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--text); display:flex; height:100vh; }
+  #side { width:340px; padding:16px; overflow:auto; background:var(--panel); border-right:1px solid var(--border); }
+  #map { flex:1; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:18px 0 6px; }
+  label { display:block; margin:6px 0 2px; color:var(--muted); font-size:12px; }
+  input, select { width:100%; padding:7px 8px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+  button { padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); width:100%; margin-top:10px; }
+  button.on { outline:2px solid var(--accent); }
+  .row { display:flex; gap:6px; margin-top:6px; }
+  .row > * { flex:1; }
+  .item { display:flex; gap:6px; align-items:center; margin:4px 0; font-size:13px; }
+  .item input { width:70px; flex:none; }
+  .item span { flex:1; }
+  .x { color:var(--danger); padding:4px 8px; }
+  #status { margin-top:10px; color:var(--muted); min-height:1.4em; }
+  #stats { font-weight:600; margin-top:6px; }
+  #qr { margin-top:10px; background:#fff; padding:8px; display:inline-block; border-radius:6px; }
+  #qr:empty { display:none; }
+  .hint { color:var(--muted); font-size:12px; }
+  @media (max-width:700px) { body { flex-direction:column; } #side { width:auto; max-height:55vh; } }
+</style>
+</head>
+<body>
+<div id="side">
+  <h1>Bike Route Planner</h1>
+
+  <label for="from">From (postcode)</label>
+  <input id="from" placeholder="Start postcode">
+  <label for="to">To (postcode)</label>
+  <input id="to" placeholder="Destination postcode">
+  <div class="row"><button id="swap">Swap direction</button></div>
+
+  <label for="profile">Road preference</label>
+  <select id="profile">
+    <option value="moped">Quiet roads, no motorways (moped)</option>
+    <option value="car-eco">Normal roads (car, economical)</option>
+    <option value="car-fast">Fastest (car - may use motorways)</option>
+  </select>
+
+  <h2>Roads to avoid</h2>
+  <div class="hint">Click 'Add avoid zone', then click on the road on the map. Drag the red dot to move it; set the radius so the circle covers the bit of road you want to avoid.</div>
+  <div class="row"><button id="modeAvoid">Add avoid zone</button><button id="modeVia">Add via point</button></div>
+  <div id="avoidList"></div>
+  <div id="viaList"></div>
+
+  <button class="primary" id="go">Plan route</button>
+  <div id="status"></div>
+  <div id="stats"></div>
+
+  <h2>Send to phone</h2>
+  <label for="wpCount">Google Maps stops to pin the route</label>
+  <select id="wpCount">
+    <option>3</option><option>5</option><option selected>7</option><option>9</option>
+  </select>
+  <div class="hint">Google Maps can't take a whole route, so the link adds stops along this route to keep it on track. More stops = closer match.</div>
+  <div class="row"><button id="openG" disabled>Open in Google Maps</button><button id="copyG" disabled>Copy link</button></div>
+  <div class="row"><button id="gpx" disabled>Download GPX</button></div>
+  <div id="qr"></div>
+  <div class="hint" id="qrHint"></div>
+</div>
+<div id="map"></div>
+
+<script>
+// ---- State (saved in this browser only) ----
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('bikeroute.' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('bikeroute.' + k, JSON.stringify(v)); } catch {} }
+};
+const $ = id => document.getElementById(id);
+$('from').value = store.get('from', '');
+$('to').value = store.get('to', '');
+$('profile').value = store.get('profile', 'moped');
+$('wpCount').value = store.get('wpCount', '7');
+
+const map = L.map('map').setView([53.47, -2.61], 11);
+// OSM and CARTO tiles refuse pages opened from a local file, so use Esri's street map (no key needed)
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom: 19, attribution: 'Tiles &copy; Esri | Routing: BRouter, &copy; OpenStreetMap contributors'
+}).addTo(map);
+
+let avoids = [];   // {lat, lng, r, circle, marker}
+let vias = [];     // {lat, lng, marker}
+let mode = null;
+let routeLine = null, routeCoords = null, endMarkers = [];
+let lastEnds = null;
+
+function setMode(m) {
+  mode = mode === m ? null : m;
+  $('modeAvoid').classList.toggle('on', mode === 'avoid');
+  $('modeVia').classList.toggle('on', mode === 'via');
+  map.getContainer().style.cursor = mode ? 'crosshair' : '';
+}
+$('modeAvoid').onclick = () => setMode('avoid');
+$('modeVia').onclick = () => setMode('via');
+
+const dot = (colour) => L.divIcon({ className: '', iconSize: [16, 16], iconAnchor: [8, 8],
+  html: `<div style="width:16px;height:16px;border-radius:50%;background:${colour};border:2px solid #fff;box-shadow:0 0 3px #000"></div>` });
+
+function addAvoid(lat, lng, r = 300) {
+  const a = { lat, lng, r };
+  a.circle = L.circle([lat, lng], { radius: r, color: '#c62828', fillOpacity: .2 }).addTo(map);
+  a.marker = L.marker([lat, lng], { draggable: true, icon: dot('#c62828') }).addTo(map);
+  a.marker.on('drag', e => { const p = e.target.getLatLng(); a.lat = p.lat; a.lng = p.lng; a.circle.setLatLng(p); });
+  a.marker.on('dragend', saveZones);
+  avoids.push(a); renderLists(); saveZones();
+}
+function addVia(lat, lng) {
+  const v = { lat, lng };
+  v.marker = L.marker([lat, lng], { draggable: true, icon: dot('#1a73e8') }).addTo(map);
+  v.marker.on('dragend', e => { const p = e.target.getLatLng(); v.lat = p.lat; v.lng = p.lng; saveZones(); });
+  vias.push(v); renderLists(); saveZones();
+}
+function saveZones() {
+  store.set('avoids', avoids.map(a => ({ lat: a.lat, lng: a.lng, r: a.r })));
+  store.set('vias', vias.map(v => ({ lat: v.lat, lng: v.lng })));
+}
+function renderLists() {
+  const al = $('avoidList'); al.innerHTML = '';
+  avoids.forEach((a, i) => {
+    const d = document.createElement('div'); d.className = 'item';
+    d.innerHTML = `<span>Avoid zone ${i + 1}</span><input type="number" min="50" step="50" value="${a.r}" title="Radius (m)">m<button class="x">✕</button>`;
+    d.querySelector('input').oninput = e => { a.r = Math.max(50, +e.target.value || 50); a.circle.setRadius(a.r); saveZones(); };
+    d.querySelector('button').onclick = () => { map.removeLayer(a.circle); map.removeLayer(a.marker); avoids.splice(i, 1); renderLists(); saveZones(); };
+    al.appendChild(d);
+  });
+  const vl = $('viaList'); vl.innerHTML = '';
+  vias.forEach((v, i) => {
+    const d = document.createElement('div'); d.className = 'item';
+    d.innerHTML = `<span>Via point ${i + 1}</span><button class="x">✕</button>`;
+    d.querySelector('button').onclick = () => { map.removeLayer(v.marker); vias.splice(i, 1); renderLists(); saveZones(); };
+    vl.appendChild(d);
+  });
+}
+map.on('click', e => {
+  if (mode === 'avoid') addAvoid(e.latlng.lat, e.latlng.lng);
+  else if (mode === 'via') addVia(e.latlng.lat, e.latlng.lng);
+  setMode(null);
+});
+store.get('avoids', []).forEach(a => addAvoid(a.lat, a.lng, a.r));
+store.get('vias', []).forEach(v => addVia(v.lat, v.lng));
+
+$('swap').onclick = () => { const f = $('from').value; $('from').value = $('to').value; $('to').value = f; vias.reverse(); renderLists(); saveZones(); };
+
+// ---- Geocoding (UK postcodes) ----
+async function geocode(pc) {
+  const r = await fetch('https://api.postcodes.io/postcodes/' + encodeURIComponent(pc.trim()));
+  const j = await r.json();
+  if (j.status !== 200) throw new Error(`Postcode '${pc}' not found`);
+  return { lat: j.result.latitude, lng: j.result.longitude };
+}
+
+// ---- Routing (BRouter, supports no-go areas) ----
+async function plan() {
+  const status = $('status'); status.textContent = 'Planning...'; $('stats').textContent = '';
+  try {
+    store.set('from', $('from').value); store.set('to', $('to').value); store.set('profile', $('profile').value);
+    const [a, b] = await Promise.all([geocode($('from').value), geocode($('to').value)]);
+    lastEnds = [a, b];
+    const pts = [a, ...vias, b].map(p => `${p.lng.toFixed(6)},${p.lat.toFixed(6)}`).join('|');
+    let url = `https://brouter.de/brouter?lonlats=${pts}&profile=${$('profile').value}&alternativeidx=0&format=geojson`;
+    if (avoids.length) url += '&nogos=' + avoids.map(z => `${z.lng.toFixed(6)},${z.lat.toFixed(6)},${Math.round(z.r)}`).join('|');
+    const r = await fetch(url);
+    const txt = await r.text();
+    if (!r.ok || txt.trim()[0] !== '{') throw new Error(txt.slice(0, 200));
+    const gj = JSON.parse(txt);
+    const f = gj.features[0];
+    routeCoords = f.geometry.coordinates.map(c => [c[1], c[0]]);
+    if (routeLine) map.removeLayer(routeLine);
+    endMarkers.forEach(m => map.removeLayer(m));
+    routeLine = L.polyline(routeCoords, { color: '#1a73e8', weight: 5, opacity: .8 }).addTo(map);
+    endMarkers = [L.marker([a.lat, a.lng]).addTo(map).bindTooltip('Start'), L.marker([b.lat, b.lng]).addTo(map).bindTooltip('Finish')];
+    map.fitBounds(routeLine.getBounds(), { padding: [30, 30] });
+    const km = (+f.properties['track-length'] / 1000).toFixed(1);
+    const mins = Math.round(+f.properties['total-time'] / 60);
+    $('stats').textContent = `${km} km (${(km * 0.621).toFixed(1)} miles), approx. ${mins} min`;
+    status.textContent = 'Route planned. Check it avoids the roads you want, then send it to your phone.';
+    ['openG', 'copyG', 'gpx'].forEach(id => $(id).disabled = false);
+    updateLink();
+  } catch (e) {
+    status.textContent = 'Could not plan route: ' + e.message;
+  }
+}
+$('go').onclick = plan;
+
+// ---- Google Maps link ----
+function cumDist(coords) {
+  const d = [0];
+  for (let i = 1; i < coords.length; i++) d.push(d[i - 1] + map.distance(coords[i - 1], coords[i]));
+  return d;
+}
+function pickWaypoints(n) {
+  const d = cumDist(routeCoords), total = d[d.length - 1];
+  const idx = new Set();
+  // Points where the route passes closest to each avoid zone / via point: these are the detours
+  // Google is most likely to "undo", so they are pinned first.
+  [...avoids, ...vias].forEach(z => {
+    let best = -1, bd = Infinity;
+    routeCoords.forEach((c, i) => { const dd = map.distance(c, [z.lat, z.lng]); if (dd < bd) { bd = dd; best = i; } });
+    if (best > 0 && best < routeCoords.length - 1) idx.add(best);
+  });
+  // Fill the rest evenly along the route
+  let k = 1;
+  const slots = Math.max(n - idx.size, 0);
+  for (let s = 1; s <= slots; s++) {
+    const target = total * s / (slots + 1);
+    while (k < d.length - 1 && d[k] < target) k++;
+    idx.add(k);
+  }
+  return [...idx].sort((x, y) => x - y).slice(0, n).map(i => routeCoords[i]);
+}
+function gLink() {
+  const n = +$('wpCount').value;
+  const wps = pickWaypoints(n);
+  const f = c => `${c[0].toFixed(6)},${c[1].toFixed(6)}`;
+  const start = routeCoords[0], end = routeCoords[routeCoords.length - 1];
+  return 'https://www.google.com/maps/dir/?api=1&travelmode=driving&dir_action=navigate'
+    + '&origin=' + f(start) + '&destination=' + f(end)
+    + '&waypoints=' + encodeURIComponent(wps.map(f).join('|'));
+}
+let wpMarkers = [];
+function updateLink() {
+  if (!routeCoords) return;
+  store.set('wpCount', $('wpCount').value);
+  wpMarkers.forEach(m => map.removeLayer(m));
+  wpMarkers = pickWaypoints(+$('wpCount').value).map((c, i) =>
+    L.circleMarker(c, { radius: 6, color: '#fff', weight: 2, fillColor: '#f9a825', fillOpacity: 1 }).addTo(map).bindTooltip('Google stop ' + (i + 1)));
+  const link = gLink();
+  $('qr').innerHTML = '';
+  new QRCode($('qr'), { text: link, width: 180, height: 180, correctLevel: QRCode.CorrectLevel.L });
+  $('qrHint').textContent = 'Scan with your phone camera to open the route in Google Maps (then it shows on Android Auto).';
+}
+$('wpCount').onchange = updateLink;
+$('openG').onclick = () => window.open(gLink(), '_blank');
+$('copyG').onclick = async () => {
+  try { await navigator.clipboard.writeText(gLink()); $('status').textContent = 'Link copied. Send it to yourself (WhatsApp, email etc.) and open it on your phone.'; }
+  catch { prompt('Copy this link:', gLink()); }
+};
+
+// ---- GPX (for OsmAnd and other apps that take a full track) ----
+$('gpx').onclick = () => {
+  const pts = routeCoords.map(c => `<trkpt lat="${c[0].toFixed(6)}" lon="${c[1].toFixed(6)}"/>`).join('');
+  const gpx = `<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1" creator="Bike Route Planner" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>Commute</name><trkseg>${pts}</trkseg></trk></gpx>`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([gpx], { type: 'application/gpx+xml' }));
+  a.download = 'commute.gpx'; a.click();
+};
+</script>
+</body>
+</html>
