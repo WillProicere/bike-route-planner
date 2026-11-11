@@ -63,11 +63,14 @@
   <div id="stats"></div>
 
   <h2>Send to phone</h2>
-  <label for="wpCount">Google Maps stops to pin the route</label>
+  <label for="wpCount">Google Maps stops</label>
   <select id="wpCount">
-    <option>3</option><option>5</option><option selected>7</option><option>9</option>
+    <option value="0" selected>Only where needed (recommended)</option>
+    <option value="1">+1 extra stop</option>
+    <option value="2">+2 extra stops</option>
+    <option value="3">+3 extra stops</option>
   </select>
-  <div class="hint">Google Maps can't take a whole route, so the link adds stops along this route to keep it on track. More stops = closer match.</div>
+  <div class="hint">Google picks its own way between stops, so the link only adds a stop on each detour (one per avoid zone or via point), placed mid-road away from junctions. Every stop is one more 'arrived' on Android Auto, so use as few as possible. Only add extras if Google strays from the blue line.</div>
   <div class="row"><button id="openG" disabled>Open in Google Maps</button><button id="copyG" disabled>Copy link</button></div>
   <div class="row"><button id="gpx" disabled>Download GPX</button></div>
   <div id="qr"></div>
@@ -85,7 +88,8 @@ const $ = id => document.getElementById(id);
 $('from').value = store.get('from', '');
 $('to').value = store.get('to', '');
 $('profile').value = store.get('profile', 'moped');
-$('wpCount').value = store.get('wpCount', '7');
+$('wpCount').value = store.get('wpCount', '0');
+if (!$('wpCount').value) $('wpCount').value = '0'; // older saved values (3-9) no longer exist
 
 const map = L.map('map').setView([53.47, -2.61], 11);
 // OSM and CARTO tiles refuse pages opened from a local file, so use Esri's street map (no key needed)
@@ -180,6 +184,7 @@ async function plan() {
     const gj = JSON.parse(txt);
     const f = gj.features[0];
     routeCoords = f.geometry.coordinates.map(c => [c[1], c[0]]);
+    buildStretches(f.properties.messages || []);
     if (routeLine) map.removeLayer(routeLine);
     endMarkers.forEach(m => map.removeLayer(m));
     routeLine = L.polyline(routeCoords, { color: '#1a73e8', weight: 5, opacity: .8 }).addTo(map);
@@ -203,25 +208,67 @@ function cumDist(coords) {
   for (let i = 1; i < coords.length; i++) d.push(d[i - 1] + map.distance(coords[i - 1], coords[i]));
   return d;
 }
-function pickWaypoints(n) {
-  const d = cumDist(routeCoords), total = d[d.length - 1];
-  const idx = new Set();
-  // Points where the route passes closest to each avoid zone / via point: these are the detours
-  // Google is most likely to "undo", so they are pinned first.
-  [...avoids, ...vias].forEach(z => {
-    let best = -1, bd = Infinity;
-    routeCoords.forEach((c, i) => { const dd = map.distance(c, [z.lat, z.lng]); if (dd < bd) { bd = dd; best = i; } });
-    if (best > 0 && best < routeCoords.length - 1) idx.add(best);
+// Split the route into "stretches" of the same road, using BRouter's per-segment road tags.
+// Stops are put in the middle of a stretch so they never land on a junction, roundabout or slip
+// road (which is what made Google arrive at a stop and then send you back on yourself).
+let routeDist = [], stretches = [];
+function buildStretches(msgs) {
+  routeDist = cumDist(routeCoords);
+  stretches = [];
+  let ci = 0, prev = 0, cur = null;
+  msgs.slice(1).forEach(r => {
+    const p = [+r[1] / 1e6, +r[0] / 1e6];
+    let best = ci, bd = Infinity;
+    for (let i = ci; i < Math.min(routeCoords.length, ci + 500); i++) {
+      const dd = Math.abs(routeCoords[i][0] - p[0]) + Math.abs(routeCoords[i][1] - p[1]);
+      if (dd < bd) { bd = dd; best = i; }
+      if (dd < 2e-6) break;
+    }
+    ci = best;
+    const tags = r[9] || '';
+    if (cur && cur.tags === tags) cur.e = best;
+    else { cur = { s: prev, e: best, tags }; stretches.push(cur); }
+    prev = best;
   });
-  // Fill the rest evenly along the route
-  let k = 1;
-  const slots = Math.max(n - idx.size, 0);
-  for (let s = 1; s <= slots; s++) {
-    const target = total * s / (slots + 1);
-    while (k < d.length - 1 && d[k] < target) k++;
-    idx.add(k);
+  const total = routeDist[routeDist.length - 1];
+  stretches.forEach(s => {
+    s.len = routeDist[s.e] - routeDist[s.s];
+    const half = (routeDist[s.s] + routeDist[s.e]) / 2;
+    let m = s.s; while (m < s.e && routeDist[m] < half) m++;
+    s.mid = m;
+    s.ok = s.len >= 250 && !/junction=|_link|highway=service/.test(s.tags)
+      && routeDist[m] > 500 && routeDist[m] < total - 500;
+  });
+}
+function stretchAt(i) { return stretches.find(s => i >= s.s && i <= s.e); }
+function goodStretchNear(i, maxDist) {
+  const here = stretchAt(i);
+  if (here && here.ok) return here;
+  let best = null, bd = Infinity;
+  stretches.forEach(s => {
+    if (!s.ok) return;
+    const dd = Math.abs(routeDist[s.mid] - routeDist[i]);
+    if (dd <= maxDist && dd < bd) { bd = dd; best = s; }
+  });
+  return best;
+}
+function pickWaypoints(extra) {
+  const total = routeDist[routeDist.length - 1];
+  const picks = [];
+  const add = s => { if (s && !picks.some(p => Math.abs(routeDist[p] - routeDist[s.mid]) < 1000)) picks.push(s.mid); };
+  // One stop on the detour road for each avoid zone / via point: Google needs these to stay off the avoided road.
+  [...avoids, ...vias].forEach(z => {
+    let best = 0, bd = Infinity;
+    routeCoords.forEach((c, i) => { const dd = map.distance(c, [z.lat, z.lng]); if (dd < bd) { bd = dd; best = i; } });
+    add(goodStretchNear(best, 1500));
+  });
+  // Optional extra stops spread evenly along the route
+  for (let k = 1; k <= extra; k++) {
+    const target = total * k / (extra + 1);
+    const i = routeDist.findIndex(x => x >= target);
+    add(goodStretchNear(i, 3000));
   }
-  return [...idx].sort((x, y) => x - y).slice(0, n).map(i => routeCoords[i]);
+  return picks.sort((x, y) => x - y).slice(0, 9).map(i => routeCoords[i]);
 }
 function gLink() {
   const n = +$('wpCount').value;
